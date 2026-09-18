@@ -34,6 +34,7 @@ import {
   ReplayController,
   ReplayShade,
   type ReplayState,
+  registeredIndicators,
   readChartSettings,
   type SeriesApi,
   type SeriesStyle,
@@ -147,6 +148,20 @@ import {
   readProfileSettings,
 } from './profileSettings'
 import { profileSettingsView } from './profileSettingsView'
+import {
+  SignalLedger,
+  signalFromAlert,
+  signalKey,
+  signalsFromMarkers,
+  stableJson,
+  type IndicatorSignal,
+  type SignalSide,
+} from './signalBridge'
+import {
+  getIndicatorOrderStatus,
+  getIndicatorPositions,
+  placeIndicatorOrder,
+} from './indicatorTradingApi'
 
 export type OrderSide = 'BUY' | 'SELL'
 export type OrderType = 'MARKET' | 'LIMIT' | 'SL' | 'SL-M'
@@ -343,6 +358,16 @@ function drawingTextContrast(background: string): string {
 const DRAWING_TEXT_PX = 12
 
 /** Everything needed to generate an indicator settings form. */
+export interface IndicatorTradingSettings {
+  /** Signal execution is opt-in per enabled indicator instance. */
+  enabled: boolean
+  /** Shares or lots, using the same quantity convention as the chart ticket. */
+  quantity: number
+  product: 'MIS' | 'NRML' | 'CNC'
+  priceType: OrderType
+  strategy: string
+}
+
 export interface IndicatorSettingsRequest {
   instanceId: string
   name: string
@@ -351,6 +376,10 @@ export interface IndicatorSettingsRequest {
   /** Generated per-plot colour / width / dash inputs — the "Style" tab. */
   styleInputs: IndicatorField[]
   values: Record<string, unknown>
+  /** Host-owned signal execution settings; never passed to calc or markers. */
+  trading: IndicatorTradingSettings
+  /** Products valid for the current chart segment. */
+  productOptions: ('MIS' | 'NRML' | 'CNC')[]
 }
 
 export interface IndicatorField {
@@ -684,6 +713,15 @@ export class TradingTerminal {
   private drawEnabled = false
   private activeIndicators: SavedIndicatorRecord[] = []
   private indicatorsLoaded = false
+  /** Host-owned signal configuration, keyed by descriptor + normalized settings. */
+  private indicatorTrading: Record<string, IndicatorTradingSettings> = {}
+  /** Persistent signal claims survive chart rebuilds and browser reloads. */
+  private readonly signalLedger = new SignalLedger()
+  private offSignalAlert: (() => void) | null = null
+  /** The live path becomes eligible only after the first new candle is observed. */
+  private signalLive = false
+  private lastSignalConfirmationTime: number | null = null
+  private signalErrors = new Set<string>()
   /** Guards syncIndicators while applyIndicators is mid-flight. */
   private applyingIndicators = false
   /** The generation whose saved instances are still crossing an async tier load. */
@@ -863,6 +901,14 @@ export class TradingTerminal {
     this.sk = opts.storageKey || 'oa-trading'
     this.interval = this.lsGet('interval') || '5m'
     this.ctype = this.lsGet('ctype') || 'candlestick'
+    try {
+      const savedTrading = JSON.parse(this.lsGet('indicator-trading') || '{}')
+      if (savedTrading && typeof savedTrading === 'object' && !Array.isArray(savedTrading)) {
+        this.indicatorTrading = savedTrading as Record<string, IndicatorTradingSettings>
+      }
+    } catch {
+      this.indicatorTrading = {}
+    }
     this.restoreChartTools()
     if (!CHART_TYPES[this.ctype]) this.ctype = 'candlestick'
   }
@@ -1563,6 +1609,8 @@ export class TradingTerminal {
     this.detachDrawing()
     this.offBranding?.()
     this.offBranding = null
+    this.offSignalAlert?.()
+    this.offSignalAlert = null
     if (this.chart) this.chart.destroy()
     // The primitives registered here belonged to the chart just destroyed.
     this.screenshotExcluded.length = 0
@@ -1623,6 +1671,12 @@ export class TradingTerminal {
       this.sym
         ? { symbol: this.sym.symbol, exchange: this.sym.exchange, interval: this.interval }
         : { interval: this.interval }
+    )
+    // Keep the package's declarative alert channel available for custom chart
+    // hosts that emit typed signal metadata. No broker work happens in this
+    // callback; it only enters the same closed-candle bridge as markers.
+    this.offSignalAlert = this.chart.on('indicator:alert', (payload) =>
+      this.handleIndicatorAlert(payload)
     )
     this.offBranding = this.chart.on('branding:changed', () => {
       this.cb.onBrandingChange?.(this.brandingLink())
@@ -2496,7 +2550,12 @@ export class TradingTerminal {
       },
       commands
     )
-    if (changed) this.syncIndicators()
+    if (changed) {
+      this.syncIndicators()
+      // Agent-added instances have the same historical-signal rule as picker
+      // additions: seed visible markers before the next candle can be confirmed.
+      this.primeAllIndicatorSignals()
+    }
   }
 
   /* ── indicators + grid (top-menu extras) ───────────────────────────────── */
@@ -2575,6 +2634,69 @@ export class TradingTerminal {
       if (this.restoringIndicatorsOn === chart) this.restoringIndicatorsOn = null
     }
     this.syncIndicators()
+    this.primeAllIndicatorSignals()
+  }
+
+  /** Stable key for a descriptor instance's host-owned execution settings. */
+  private indicatorTradingKey(inst: { indicatorId: string; settings(): Record<string, unknown> }): string {
+    return `${inst.indicatorId}:${stableJson(inst.settings())}`
+  }
+
+  private defaultIndicatorTrading(inst: { indicatorId: string }): IndicatorTradingSettings {
+    const product = this.sym?.productOptions.includes(this.product)
+      ? this.product
+      : this.sym?.productOptions[0] ?? 'MIS'
+    return {
+      // Live execution is deliberately opt-in. Adding an indicator must never
+      // surprise a trader with an order; enabling it is the explicit action that
+      // makes the indicator an execution source.
+      enabled: false,
+      quantity: 1,
+      product: product as 'MIS' | 'NRML' | 'CNC',
+      priceType: 'MARKET',
+      strategy: `indicator:${inst.indicatorId}`,
+    }
+  }
+
+  private tradingFor(inst: { indicatorId: string; settings(): Record<string, unknown> }): IndicatorTradingSettings {
+    const key = this.indicatorTradingKey(inst)
+    const saved = this.indicatorTrading[key]
+    const fallback = this.defaultIndicatorTrading(inst)
+    if (!saved) return fallback
+    const products = this.sym?.productOptions ?? ['MIS', 'NRML', 'CNC']
+    return {
+      ...fallback,
+      ...saved,
+      enabled: saved.enabled === true,
+      quantity: Number.isFinite(Number(saved.quantity)) ? Math.max(1, Math.floor(Number(saved.quantity))) : 1,
+      product: products.includes(saved.product) ? saved.product : fallback.product,
+      priceType: ['MARKET', 'LIMIT', 'SL', 'SL-M'].includes(saved.priceType) ? saved.priceType : 'MARKET',
+      strategy: typeof saved.strategy === 'string' && saved.strategy.trim() ? saved.strategy : fallback.strategy,
+    }
+  }
+
+  private saveIndicatorTrading(): void {
+    this.lsSet('indicator-trading', JSON.stringify(this.indicatorTrading))
+  }
+
+  private setIndicatorTrading(instanceId: string, trading: IndicatorTradingSettings): void {
+    const inst = this.chart?.indicators().find((i) => i.id === instanceId)
+    if (!inst) return
+    const key = this.indicatorTradingKey(inst)
+    const fallback = this.defaultIndicatorTrading(inst)
+    const products = this.sym?.productOptions ?? ['MIS', 'NRML', 'CNC']
+    const priceTypes: OrderType[] = ['MARKET', 'LIMIT', 'SL', 'SL-M']
+    this.indicatorTrading[key] = {
+      ...fallback,
+      ...trading,
+      enabled: trading.enabled === true,
+      quantity: Math.max(1, Math.floor(Number(trading.quantity) || 1)),
+      product: products.includes(trading.product) ? trading.product : fallback.product,
+      priceType: priceTypes.includes(trading.priceType) ? trading.priceType : fallback.priceType,
+      strategy: trading.strategy?.trim() || fallback.strategy,
+    }
+    this.saveIndicatorTrading()
+    if (trading.enabled) this.primeIndicatorSignals(inst.id)
   }
 
   /** Gather a settings form for one live indicator and hand it to the host. */
@@ -2594,6 +2716,8 @@ export class TradingTerminal {
       values: { ...inst.settings() },
       inputs: descriptor.inputs.map(toField),
       styleInputs: indicatorStyleInputs(descriptor).map(toField),
+      trading: this.tradingFor(inst),
+      productOptions: (this.sym?.productOptions ?? ['MIS', 'NRML', 'CNC']) as ('MIS' | 'NRML' | 'CNC')[],
     })
   }
 
@@ -2606,12 +2730,26 @@ export class TradingTerminal {
     return d ? { ...indicatorDefaults(d) } : null
   }
 
-  /** Apply a settings patch to a live indicator. */
-  updateIndicatorSettings(instanceId: string, patch: Record<string, unknown>): void {
+  /** Apply indicator values and the separate host-owned trading settings. */
+  updateIndicatorSettings(
+    instanceId: string,
+    patch: Record<string, unknown>,
+    trading?: IndicatorTradingSettings
+  ): void {
     const inst = this.chart?.indicators().find((i) => i.id === instanceId)
     if (!inst) return
+    const beforeKey = this.indicatorTradingKey(inst)
+    const previousTrading = this.indicatorTrading[beforeKey]
     inst.setSettings(patch)
+    const afterKey = this.indicatorTradingKey(inst)
+    if (previousTrading && beforeKey !== afterKey) {
+      this.indicatorTrading[afterKey] = previousTrading
+      delete this.indicatorTrading[beforeKey]
+      this.saveIndicatorTrading()
+    }
+    if (trading) this.setIndicatorTrading(instanceId, trading)
     this.syncIndicators()
+    if (trading?.enabled) this.primeIndicatorSignals(inst.id)
   }
 
   /** Open the settings form for an indicator from the host's own UI. */
@@ -2828,6 +2966,7 @@ export class TradingTerminal {
     try {
       const inst = this.chart.addIndicator(indicatorId, {})
       this.syncIndicators()
+      this.primeIndicatorSignals(inst.id)
       this.warnIfStarved(inst)
     } catch (e) {
       this.toast(this.cleanError(e), 'err')
@@ -2860,6 +2999,227 @@ export class TradingTerminal {
       `${inst.name} needs more history than the ${loaded} bars loaded, so it has nothing to draw yet. Widen the range or pick a longer interval.`,
       ''
     )
+  }
+
+  /**
+   * The chart engine calculates indicators from the displayed primary bars. For
+   * ordinary candles that is rawBars; transformed chart types expose shownBars
+   * with the same shape and length as the indicator values. Prefer the latter
+   * when it matches a live instance, so a marker remains anchored to the candle
+   * it is actually painting.
+   */
+  private signalBars(inst: { values(): Record<string, unknown> }): readonly Bar[] {
+    const values = inst.values()
+    const length = Object.values(values).find(Array.isArray)?.length
+    if (length === this.shownBars.length) return this.shownBars
+    return this.rawBars
+  }
+
+  private markerSignalsFor(instanceId: string): IndicatorSignal[] {
+    if (!this.chart) return []
+    const inst = this.chart.indicators().find((i) => i.id === instanceId)
+    if (!inst || !inst.visible()) return []
+    const descriptor = registeredIndicators().find((d) => d.id === inst.indicatorId)
+    if (!descriptor?.markers) return []
+    try {
+      return signalsFromMarkers({ descriptor, instance: inst, bars: this.signalBars(inst) })
+    } catch (error) {
+      // A broken custom marker must not stop the chart or the other indicators.
+      if (!this.signalErrors.has(inst.indicatorId)) {
+        this.signalErrors.add(inst.indicatorId)
+        this.toast(`${inst.name} signal markers failed: ${this.cleanError(error)}`, 'err')
+      }
+      return []
+    }
+  }
+
+  private signalLedgerKey(signal: IndicatorSignal, inst: { settings(): Record<string, unknown> }): string | null {
+    if (!this.sym || this.sym.synthetic || !Number.isFinite(signal.time)) return null
+    return signalKey({
+      symbol: this.sym.symbol,
+      exchange: this.sym.exchange,
+      interval: this.interval,
+      indicatorId: signal.indicatorId,
+      settings: inst.settings(),
+      side: signal.side,
+      time: signal.time,
+    })
+  }
+
+  /** Mark all signals already on screen as historical, never executable. */
+  private primeIndicatorSignals(instanceId: string): void {
+    if (!this.chart) return
+    const inst = this.chart.indicators().find((i) => i.id === instanceId)
+    if (!inst) return
+    for (const signal of this.markerSignalsFor(instanceId)) {
+      const key = this.signalLedgerKey(signal, inst)
+      if (key) this.signalLedger.seed(key)
+    }
+  }
+
+  private primeAllIndicatorSignals(): void {
+    // Some lightweight chart doubles used by hosts/tests only implement the
+    // persistence surface, not the indicator tier. Signal seeding is optional
+    // there and must never break chart restoration.
+    const indicators = this.chart && typeof this.chart.indicators === 'function' ? this.chart.indicators() : []
+    for (const inst of indicators) this.primeIndicatorSignals(inst.id)
+  }
+
+  /**
+   * Handle only the bar that just closed. Recalculation of older bars is
+   * harmless because the persistent ledger already owns their identities.
+   */
+  private processConfirmedSignals(closedTime: number): void {
+    if (!this.signalLive || !this.chart || !this.sym || this.replayActive()) return
+    this.lastSignalConfirmationTime = closedTime
+    for (const inst of this.chart.indicators()) {
+      const config = this.tradingFor(inst)
+      if (!config.enabled || !inst.visible()) continue
+      for (const signal of this.markerSignalsFor(inst.id)) {
+        if (signal.time !== closedTime) continue
+        const key = this.signalLedgerKey(signal, inst)
+        if (!key || !this.signalLedger.claim(key)) continue
+        void this.executeIndicatorSignal(signal, config, key)
+      }
+    }
+  }
+
+  /**
+   * Alerts are accepted only when a custom host supplies typed side metadata.
+   * The built-in/custom marker route above remains the canonical visible route.
+   */
+  private handleIndicatorAlert(payload: unknown): void {
+    if (!this.signalLive || !this.chart || !this.sym || this.replayActive()) return
+    const signal = signalFromAlert(payload)
+    if (!signal || signal.time !== this.lastSignalConfirmationTime) return
+    const inst = this.chart.indicators().find((i) => i.id === signal.instanceId)
+    if (!inst || !inst.visible()) return
+    const config = this.tradingFor(inst)
+    if (!config.enabled) return
+    const key = this.signalLedgerKey(signal, inst)
+    if (!key || !this.signalLedger.claim(key)) return
+    void this.executeIndicatorSignal(signal, config, key)
+  }
+
+  private signalPrice(type: OrderType, side: SignalSide): number | undefined {
+    if (type === 'MARKET' || type === 'SL-M') return undefined
+    const market = this.marketPrice()
+    if (market == null) return undefined
+    const price = this.snap(market)
+    if (type !== 'SL') return price
+    // A stop signal needs to sit on the executable side of the current quote.
+    const step = this.tick()
+    return this.snap(side === 'BUY' ? price + step : Math.max(step, price - step))
+  }
+
+  private async verifySignalOrder(orderId: string): Promise<string> {
+    // Signal execution uses the session-authenticated server boundary rather
+    // than the browser trade feed. This keeps broker credentials out of the
+    // chart bundle and verifies the order against the same authenticated broker
+    // session that accepted it.
+    for (let attempt = 0; attempt < 3; attempt++) {
+      try {
+        const response = await getIndicatorOrderStatus(orderId)
+        const data = response.data as { order_status?: unknown; status?: unknown } | undefined
+        const status = response.order_status ?? data?.order_status ?? data?.status
+        if (typeof status === 'string' && status) return status.toLowerCase()
+      } catch {
+        // The place response is still authoritative for deduplication; retry
+        // the read a couple of times so a fast broker acknowledgement is visible.
+      }
+      await new Promise((resolve) => setTimeout(resolve, 150 * (attempt + 1)))
+    }
+    return 'unknown'
+  }
+
+  /**
+   * Signal -> deduplication -> execution bridge. Neither calc nor markers can
+   * reach this method, which keeps broker side effects out of indicator code.
+   */
+  private async executeIndicatorSignal(
+    signal: IndicatorSignal,
+    config: IndicatorTradingSettings,
+    key: string
+  ): Promise<void> {
+    if (!this.sym || this.sym.synthetic || this.sym.quoteOnly) {
+      this.signalLedger.complete(key, 'skipped')
+      return
+    }
+    const quantity = orderUnits(config.quantity, this.sym.lots, this.sym.lotsize)
+    if (this.sym.freezeQty > 1 && quantity > this.sym.freezeQty) {
+      this.signalLedger.complete(key, 'rejected')
+      this.toast(`${signal.label}: quantity exceeds freeze limit ${this.sym.freezeQty}`, 'err')
+      return
+    }
+
+    try {
+      // The browser asks for the active instrument's position through the
+      // session-authenticated bridge. It never supplies an OpenAlgo API key.
+      // The server also resolves Analyze/Paper versus Live, so a stale theme
+      // store cannot route a signal using an old client-side mode.
+      const positions = await getIndicatorPositions()
+      const position = positions.find((p) => p.symbol === this.sym!.symbol)
+      const net = Number(position?.netqty ?? position?.net_qty ?? position?.quantity ?? 0)
+      const sameDirection = (signal.side === 'BUY' && net > 0) || (signal.side === 'SELL' && net < 0)
+      if (sameDirection) {
+        this.signalLedger.complete(key, 'skipped')
+        this.toast(`${signal.label}: position already ${net > 0 ? 'long' : 'short'}, signal skipped`, '')
+        return
+      }
+
+      // A single opposite-side order closes the old net and opens the requested
+      // side in broker netting mode. This is deterministic and avoids a gap
+      // between separate close and entry requests during a reversal.
+      const reversalQty = Math.abs(net) + quantity
+      if (this.sym.freezeQty > 1 && reversalQty > this.sym.freezeQty) {
+        this.signalLedger.complete(key, 'rejected')
+        this.toast(`${signal.label}: reversal quantity exceeds freeze limit ${this.sym.freezeQty}`, 'err')
+        return
+      }
+      const type = config.priceType
+      const price = this.signalPrice(type, signal.side)
+      if (type !== 'MARKET' && price == null) {
+        this.signalLedger.complete(key, 'rejected')
+        this.toast(`${signal.label}: no market price for ${type} order`, 'err')
+        return
+      }
+      const result = await placeIndicatorOrder({
+        symbol: this.sym.symbol,
+        exchange: this.sym.exchange,
+        action: signal.side,
+        quantity: reversalQty,
+        product: config.product,
+        pricetype: type,
+        strategy: config.strategy || STRATEGY,
+        price,
+        trigger_price: type === 'SL' || type === 'SL-M' ? price : undefined,
+      })
+      if (result.mode === 'analyze' || result.order_status === 'paper') {
+        this.signalLedger.complete(key, 'paper')
+        this.toast(
+          `PAPER ${signal.side} ${quantity} ${this.sym.symbol} · ${config.product} · ${config.priceType}`,
+          'ok'
+        )
+        return
+      }
+      const orderId = result.orderid || ''
+      if (!orderId) throw new Error('OpenAlgo did not return an order ID')
+      const status = await this.verifySignalOrder(orderId)
+      if (status === 'rejected' || status === 'cancelled' || status === 'canceled') {
+        this.signalLedger.complete(key, 'rejected', orderId)
+        this.toast(`${signal.label}: order ${status}`, 'err')
+      } else {
+        this.signalLedger.complete(key, 'sent', orderId)
+        this.toast(`${signal.label}: ${signal.side} ${reversalQty} ${this.sym.symbol} · ${status}`, 'ok')
+      }
+      this.pollBook()
+    } catch (error) {
+      // The claim remains represented as rejected rather than being released:
+      // retrying an ambiguous network response is how duplicate live orders are
+      // created. The order feed itself also keeps its client token claim.
+      this.signalLedger.complete(key, 'rejected')
+      this.toast(`${signal.label}: ${this.cleanError(error)}`, 'err')
+    }
   }
 
   removeIndicatorById(instanceId: string): void {
@@ -3391,6 +3751,7 @@ export class TradingTerminal {
         // builder that ever disagrees with rawBars about the current bucket
         // overwrites that bar instead of appending a duplicate of it.
         const last = this.rawBars[this.rawBars.length - 1]
+        const closedTime = u.isNew ? last?.time ?? null : null
         if (last && last.time === u.bar.time) this.rawBars[this.rawBars.length - 1] = u.bar
         else this.rawBars.push(u.bar)
         // History and live bars share one bounded store. The terminal retains
@@ -3412,6 +3773,13 @@ export class TradingTerminal {
         }
         // One bar in, one bar out. Only a transformed chart has to rebuild.
         if (!this.updateLiveBar(u.bar)) this.setPriceData()
+        // `isNew` is the builder's confirmation boundary: the previous candle
+        // cannot change any more. Historical loads and ordinary live ticks never
+        // enter this branch, so recalculation cannot place an old signal.
+        if (closedTime != null && !this.replay) {
+          this.signalLive = true
+          this.processConfirmedSignals(closedTime)
+        }
       }
     }
     // The legend belongs to the bar on screen. During replay that is the
@@ -3863,6 +4231,8 @@ export class TradingTerminal {
     const to = this.gridNow()
     this.lastLtp = null
     this.liveBucket = null
+    this.signalLive = false
+    this.lastSignalConfirmationTime = null
     this.noMoreHistory = false
     let bars: readonly Bar[]
     try {
@@ -4289,7 +4659,14 @@ export class TradingTerminal {
     this.offData = this.data.subscribe((snapshot) => this.applyDataSnapshot(snapshot))
     document.addEventListener('visibilitychange', this.onVisibilityChange)
     this.onVisibilityChange()
-    this.trade = new OpenAlgoTradeFeed({ baseUrl: '', apiKey: this.apiKey, strategy: STRATEGY })
+    this.trade = new OpenAlgoTradeFeed({
+      baseUrl: '',
+      apiKey: this.apiKey,
+      strategy: STRATEGY,
+      // The platform mode is server-global. Check it at the order boundary so
+      // a stale tab can never turn a signal into an unintended live request.
+      verifyMode: 'always',
+    })
 
     // broker-supported intervals → the timeframe dropdown
     let groups: IntervalGroup[]
@@ -4398,6 +4775,8 @@ export class TradingTerminal {
     this.destroyed = true
     this.offBranding?.()
     this.offBranding = null
+    this.offSignalAlert?.()
+    this.offSignalAlert = null
     this.cb.onBrandingChange?.(null)
     document.removeEventListener('visibilitychange', this.onVisibilityChange)
     this.offData?.()
