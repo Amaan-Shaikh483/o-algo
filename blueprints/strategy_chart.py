@@ -10,9 +10,15 @@ import os
 
 from flask import Blueprint, jsonify, request, session
 from flask_cors import cross_origin
+from marshmallow import ValidationError
 
 from database.auth_db import get_api_key_for_tradingview, get_auth_token
+from database.settings_db import get_analyze_mode
 from limiter import limiter
+from restx_api.schemas import OrderSchema
+from services.orderbook_service import get_orderbook_with_auth
+from services.place_order_service import place_order_with_auth
+from services.positionbook_service import get_positionbook_with_auth
 from services.intervals_service import get_intervals
 from services.multi_strike_oi_service import get_multi_strike_oi_data
 from services.strategy_chart_service import get_strategy_chart_data
@@ -27,6 +33,128 @@ STRATEGY_CHART_LIMIT = os.getenv("STRATEGY_CHART_LIMIT", "30 per minute")
 
 # Upper bound for the `days` lookback. The UI offers at most ten.
 MAX_DAYS = 30
+INDICATOR_ORDER_LIMIT = os.getenv("INDICATOR_ORDER_LIMIT", "10 per second")
+
+
+def _indicator_session():
+    """Return the broker session used by the chart signal execution boundary."""
+    username = session.get("user")
+    broker = session.get("broker")
+    if not username or not broker:
+        return None, None, (jsonify({"status": "error", "message": "Authentication required"}), 401)
+    auth_token = get_auth_token(username)
+    if not auth_token:
+        return None, None, (jsonify({"status": "error", "message": "Broker authentication required"}), 401)
+    return auth_token, broker, None
+
+
+@strategy_chart_bp.route("/trading/api/indicator-order", methods=["POST"])
+@check_session_validity
+@limiter.limit(INDICATOR_ORDER_LIMIT)
+def indicator_order():
+    """Place one chart-indicator order without exposing an OpenAlgo API key."""
+    try:
+        # Analyze/Paper is intentionally resolved before any broker call. The
+        # chart only reports the simulated action; it must not create a sandbox
+        # or live broker order as a side effect of a paper signal.
+        if get_analyze_mode():
+            return jsonify(
+                {
+                    "status": "success",
+                    "mode": "analyze",
+                    "order_status": "paper",
+                    "message": "Indicator order simulated",
+                }
+            ), 200
+
+        auth_token, broker, error = _indicator_session()
+        if error:
+            return error
+
+        body = request.get_json(silent=True) or {}
+        allowed = {
+            "strategy",
+            "symbol",
+            "exchange",
+            "action",
+            "quantity",
+            "pricetype",
+            "product",
+            "price",
+            "trigger_price",
+            "disclosed_quantity",
+        }
+        payload = {key: body[key] for key in allowed if key in body}
+        # OrderSchema is reused as the single source of truth for exchange,
+        # product, side, price-type, and quantity validation. A sentinel API
+        # key satisfies that schema and is discarded before the broker path.
+        validated = OrderSchema().load({"apikey": "session-auth", **payload})
+        validated.pop("apikey", None)
+        original = dict(validated)
+        _success, response, status_code = place_order_with_auth(
+            order_data=validated,
+            auth_token=auth_token,
+            broker=broker,
+            original_data=original,
+            force_live=True,
+        )
+        return jsonify(response), status_code
+    except ValidationError as exc:
+        return jsonify({"status": "error", "message": str(exc.messages)}), 400
+    except Exception as exc:
+        logger.exception("Error placing chart indicator order: %s", exc)
+        return jsonify({"status": "error", "message": "Indicator order failed"}), 500
+
+
+@strategy_chart_bp.route("/trading/api/indicator-positions", methods=["GET"])
+@check_session_validity
+def indicator_positions():
+    """Read live positions for the indicator execution bridge."""
+    try:
+        if get_analyze_mode():
+            return jsonify({"status": "success", "mode": "analyze", "data": []}), 200
+        auth_token, broker, error = _indicator_session()
+        if error:
+            return error
+        _success, response, status_code = get_positionbook_with_auth(auth_token, broker)
+        return jsonify(response), status_code
+    except Exception as exc:
+        logger.exception("Error reading chart indicator positions: %s", exc)
+        return jsonify({"status": "error", "message": "Unable to read positions"}), 500
+
+
+@strategy_chart_bp.route("/trading/api/indicator-order-status", methods=["POST"])
+@check_session_validity
+def indicator_order_status():
+    """Verify a live indicator order through the server-side broker session."""
+    try:
+        auth_token, broker, error = _indicator_session()
+        if error:
+            return error
+        body = request.get_json(silent=True) or {}
+        orderid = str(body.get("orderid") or "").strip()
+        if not orderid:
+            return jsonify({"status": "error", "message": "orderid is required"}), 400
+
+        # This is deliberately a direct broker-session read rather than the
+        # public order-status service. If the operator switches the global mode
+        # after a live order is accepted, the already-issued live order must
+        # still be verified against the live broker book, not the paper sandbox.
+        _success, orderbook, status_code = get_orderbook_with_auth(auth_token, broker)
+        if orderbook.get("status") != "success":
+            return jsonify(orderbook), status_code
+        raw = orderbook.get("data", {})
+        orders = raw.get("orders", []) if isinstance(raw, dict) else raw
+        found = next(
+            (order for order in orders if str(order.get("orderid")) == orderid),
+            None,
+        ) if isinstance(orders, list) else None
+        if found is None:
+            return jsonify({"status": "error", "message": "Order not found"}), 404
+        return jsonify({"status": "success", "data": found}), 200
+    except Exception as exc:
+        logger.exception("Error verifying chart indicator order: %s", exc)
+        return jsonify({"status": "error", "message": "Unable to verify order status"}), 500
 
 
 @strategy_chart_bp.route("/strategybuilder/api/strategy-chart", methods=["POST"])

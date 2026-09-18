@@ -10,14 +10,22 @@
  * with no indicator-specific code.
  */
 import { useEffect, useMemo, useState } from 'react'
-import type { IndicatorField, IndicatorSettingsRequest } from '@/lib/trading/terminal'
+import type {
+  IndicatorField,
+  IndicatorSettingsRequest,
+  IndicatorTradingSettings,
+} from '@/lib/trading/terminal'
 import { cn } from '@/lib/utils'
 import { PlotStyleRow } from './PlotStyleRow'
 import { TickBox } from './TickBox'
 
 interface Props {
   req: IndicatorSettingsRequest | null
-  onApply(instanceId: string, patch: Record<string, unknown>): void
+  onApply(
+    instanceId: string,
+    patch: Record<string, unknown>,
+    trading?: IndicatorTradingSettings
+  ): void
   onDefaults(instanceId: string): Promise<Record<string, unknown> | null>
   onClose(): void
 }
@@ -53,10 +61,12 @@ export const CONTROL =
 
 export function IndicatorSettingsDialog({ req, onApply, onDefaults, onClose }: Props) {
   const [values, setValues] = useState<Record<string, unknown>>({})
-  const [tab, setTab] = useState<'inputs' | 'style'>('inputs')
+  const [trading, setTrading] = useState<IndicatorTradingSettings | null>(null)
+  const [tab, setTab] = useState<'inputs' | 'style' | 'trading'>('inputs')
 
   useEffect(() => {
     setValues(req ? { ...req.values } : {})
+    setTrading(req ? { ...req.trading } : null)
     setTab(req && req.inputs.length === 0 ? 'style' : 'inputs')
   }, [req])
 
@@ -70,7 +80,7 @@ export function IndicatorSettingsDialog({ req, onApply, onDefaults, onClose }: P
   }, [req, onClose])
 
   const fields = useMemo(
-    () => (req ? (tab === 'inputs' ? req.inputs : req.styleInputs) : []),
+    () => (req ? (tab === 'inputs' ? req.inputs : tab === 'style' ? req.styleInputs : []) : []),
     [req, tab]
   )
 
@@ -78,7 +88,8 @@ export function IndicatorSettingsDialog({ req, onApply, onDefaults, onClose }: P
 
   const set = (key: string, v: unknown) => setValues((prev) => ({ ...prev, [key]: v }))
   const apply = () => {
-    onApply(req.instanceId, values)
+    if (!trading) return
+    onApply(req.instanceId, values, trading)
     onClose()
   }
   const reset = async () => {
@@ -86,9 +97,10 @@ export function IndicatorSettingsDialog({ req, onApply, onDefaults, onClose }: P
     if (d) setValues(d)
   }
 
-  const tabs: { key: 'inputs' | 'style'; label: string; n: number }[] = [
+  const tabs: { key: 'inputs' | 'style' | 'trading'; label: string; n: number }[] = [
     { key: 'inputs', label: 'Inputs', n: req.inputs.length },
     { key: 'style', label: 'Style', n: req.styleInputs.length },
+    { key: 'trading', label: 'Trading', n: 1 },
   ]
 
   return (
@@ -144,7 +156,106 @@ export function IndicatorSettingsDialog({ req, onApply, onDefaults, onClose }: P
 
         {/* Fields */}
         <div className="min-h-0 flex-1 overflow-y-auto px-4 py-3">
-          {tab === 'style' ? (
+          {tab === 'trading' && trading ? (
+            <div className="flex flex-col gap-4">
+              <div className="rounded border border-primary/30 bg-primary/5 p-3 text-[12px] leading-relaxed text-muted-foreground">
+                The chart marker is the signal source. When enabled, only a new closed-candle signal
+                can enter the execution bridge; historical markers and recalculations are seeded
+                into the duplicate ledger.
+              </div>
+              <div className="grid grid-cols-[minmax(0,1fr)_150px] items-center gap-x-5 gap-y-3">
+                <label
+                  htmlFor={`${req.instanceId}-signal-enabled`}
+                  className="text-[13px] text-muted-foreground"
+                >
+                  Auto-trade confirmed signals
+                </label>
+                <TickBox
+                  id={`${req.instanceId}-signal-enabled`}
+                  checked={trading.enabled}
+                  onChange={(value) => setTrading({ ...trading, enabled: value })}
+                />
+                <label
+                  htmlFor={`${req.instanceId}-signal-quantity`}
+                  className="text-[13px] text-muted-foreground"
+                >
+                  Quantity / lots
+                </label>
+                <input
+                  id={`${req.instanceId}-signal-quantity`}
+                  type="number"
+                  min={1}
+                  step={1}
+                  value={trading.quantity}
+                  onChange={(event) =>
+                    setTrading({
+                      ...trading,
+                      quantity: Math.max(1, Math.floor(Number(event.target.value) || 1)),
+                    })
+                  }
+                  className={cn(CONTROL, 'w-full')}
+                />
+                <label
+                  htmlFor={`${req.instanceId}-signal-product`}
+                  className="text-[13px] text-muted-foreground"
+                >
+                  Product
+                </label>
+                <select
+                  id={`${req.instanceId}-signal-product`}
+                  value={trading.product}
+                  onChange={(event) =>
+                    setTrading({
+                      ...trading,
+                      product: event.target.value as IndicatorTradingSettings['product'],
+                    })
+                  }
+                  className={cn(CONTROL, 'w-full')}
+                >
+                  {req.productOptions.map((product) => (
+                    <option key={product} value={product}>
+                      {product}
+                    </option>
+                  ))}
+                </select>
+                <label
+                  htmlFor={`${req.instanceId}-signal-price-type`}
+                  className="text-[13px] text-muted-foreground"
+                >
+                  Price type
+                </label>
+                <select
+                  id={`${req.instanceId}-signal-price-type`}
+                  value={trading.priceType}
+                  onChange={(event) =>
+                    setTrading({
+                      ...trading,
+                      priceType: event.target.value as IndicatorTradingSettings['priceType'],
+                    })
+                  }
+                  className={cn(CONTROL, 'w-full')}
+                >
+                  <option value="MARKET">Market</option>
+                  <option value="LIMIT">Limit</option>
+                  <option value="SL-M">SL-M</option>
+                  <option value="SL">SL-L</option>
+                </select>
+                <label
+                  htmlFor={`${req.instanceId}-signal-strategy`}
+                  className="text-[13px] text-muted-foreground"
+                >
+                  Strategy label
+                </label>
+                <input
+                  id={`${req.instanceId}-signal-strategy`}
+                  type="text"
+                  value={trading.strategy}
+                  onChange={(event) => setTrading({ ...trading, strategy: event.target.value })}
+                  className={cn(CONTROL, 'w-full')}
+                />
+              </div>
+            </div>
+          ) : tab === 'style' ? (
             // One row per plot — the generated style inputs are flat, but each
             // carries its plot title as `group`, so they regroup cleanly.
             <div className="flex flex-col gap-2.5">
@@ -171,7 +282,7 @@ export function IndicatorSettingsDialog({ req, onApply, onDefaults, onClose }: P
               ))}
             </div>
           )}
-          {fields.length === 0 && (
+          {tab !== 'trading' && fields.length === 0 && (
             <p className="py-3 text-[13px] text-muted-foreground">Nothing to configure here.</p>
           )}
         </div>

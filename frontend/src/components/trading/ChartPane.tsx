@@ -947,7 +947,9 @@ export function ChartPane({
         />
         <IndicatorSettingsDialog
           req={indSettings}
-          onApply={(id, patch) => terminalRef.current?.updateIndicatorSettings(id, patch)}
+          onApply={(id, patch, trading) =>
+            terminalRef.current?.updateIndicatorSettings(id, patch, trading)
+          }
           onDefaults={(id) =>
             terminalRef.current
               ? terminalRef.current.indicatorDefaultsFor(id)
