@@ -110,6 +110,7 @@ export interface DrawStats {
 
 import type { AgentChartCommand } from '@/lib/agent/stream'
 import type { AppMode, ThemeMode } from '@/stores/themeStore'
+import { SignalBridge, type SignalBridgeDeps, AT_ENABLED_KEY } from './signalBridge'
 import {
   applyChartCommands,
   applyIndicatorCommands,
@@ -847,9 +848,68 @@ export class TradingTerminal {
   /** Serialises agent chart commands. See {@link applyChartCommands}. */
   private chartCommandQueue: Promise<void> = Promise.resolve()
   private destroyed = false
+  /** Auto-trade signal bridge: indicator alerts → dedup → order execution. */
+  private signalBridge: SignalBridge | null = null
 
   private readonly onVisibilityChange = () => {
     this.data?.setVisible(document.visibilityState !== 'hidden')
+  }
+
+  /**
+   * Build the dependency bag for the signal bridge.
+   *
+   * Called once at init. The bag reads live state through closures, so the
+   * bridge always sees the current symbol, mode and positions without being
+   * rebuilt on every chart change. The chart reference is read dynamically
+   * from `this.chart` so that after a rebuild the bridge re-attaches to the
+   * new chart instance without needing a fresh deps object.
+   */
+  private buildSignalBridgeDeps(): SignalBridgeDeps {
+    // eslint-disable-next-line @typescript-eslint/no-this-alias
+    const self = this
+    return {
+      chart: {
+        on: (event, cb) => {
+          // Read the chart fresh on every call — after a rebuild, `self.chart`
+          // points to the new instance and `attachSignalBridge` re-subscribes.
+          const chart = self.chart
+          if (!chart) return () => {}
+          return chart.on(event, cb)
+        },
+        indicators: () => self.chart?.indicators() ?? [],
+      },
+      trade: this.trade!,
+      getSymbol: () => self.sym,
+      getMode: () => self.tradeMode(),
+      getPositions: async () => {
+        try {
+          const j = await self.api<{ data?: Array<Record<string, unknown>> }>('positionbook')
+          return (j.data || []) as unknown as SignalBridgeDeps['getPositions'] extends () => Promise<infer R> ? R : never
+        } catch {
+          return []
+        }
+      },
+      toast: (msg, kind) => self.toast(msg, kind),
+      isReplayActive: () => self.tradingLocked(),
+      orderUnits: (qty, lots, lotsize) => orderUnits(qty, lots, lotsize),
+    }
+  }
+
+  /**
+   * (Re-)attach the signal bridge to the current chart.
+   *
+   * Called after every chart build and after indicators are applied. The bridge
+   * detaches its old listener first, so this is safe to call multiple times.
+   */
+  private attachSignalBridge(): void {
+    if (!this.signalBridge || !this.chart) return
+    // Rebuild deps so the chart closure captures the fresh chart instance.
+    const freshDeps = this.buildSignalBridgeDeps()
+    // Swap the chart reference inside the existing bridge.
+    this.signalBridge.detach()
+    // Create a fresh bridge wired to the current chart.
+    this.signalBridge = new SignalBridge(freshDeps)
+    this.signalBridge.attach()
   }
 
   constructor(opts: TerminalOptions) {
@@ -1819,6 +1879,9 @@ export class TradingTerminal {
     this.chart.on('objects:change', () => this.syncIndicators())
     // Scrolling back past the loaded range pages in older bars.
     this.chart.setHistoryLoader(() => void this.loadOlderHistory())
+    // Auto-trade signal bridge: re-attach to the new chart instance so
+    // indicator alert events reach the execution pipeline.
+    this.attachSignalBridge()
   }
 
   /** Safe link metadata for the active chart branding, if it supplies a destination. */
@@ -3784,6 +3847,9 @@ export class TradingTerminal {
     // that snapshot back. Carrying it across a symbol change would restore the
     // previous instrument's data onto the new one.
     this.stopReplay()
+    // Reset the auto-trade signal bridge's dedup state: signals from the
+    // previous instrument must not suppress signals on the new one.
+    this.signalBridge?.reset()
     // swap the live stream: drop the previous symbol's subscription
     if (
       this.ws &&
@@ -3976,6 +4042,31 @@ export class TradingTerminal {
   }
   oneClickArmed(): boolean {
     return this.armed
+  }
+
+  /**
+   * Whether any indicator on this chart has auto-trade enabled.
+   *
+   * Read fresh from the live chart rather than cached: the user can toggle
+   * auto-trade on any indicator at any time through its settings dialog.
+   */
+  hasAutoTradeIndicators(): boolean {
+    if (!this.chart) return false
+    return this.chart.indicators().some((inst) => {
+      const s = inst.settings()
+      return s[AT_ENABLED_KEY] === true
+    })
+  }
+
+  /**
+   * List of indicator instances that have auto-trade enabled, for the UI.
+   */
+  autoTradeIndicators(): { id: string; name: string }[] {
+    if (!this.chart) return []
+    return this.chart
+      .indicators()
+      .filter((inst) => inst.settings()[AT_ENABLED_KEY] === true)
+      .map((inst) => ({ id: inst.id, name: inst.name }))
   }
   /**
    * The Buy and Sell panel says which it is. Armed, the theme's own buy and
@@ -4291,6 +4382,11 @@ export class TradingTerminal {
     this.onVisibilityChange()
     this.trade = new OpenAlgoTradeFeed({ baseUrl: '', apiKey: this.apiKey, strategy: STRATEGY })
 
+    // Auto-trade signal bridge: indicator alerts → dedup → order execution.
+    // Uses the same trade feed the chart's manual order path uses, so mode
+    // assertion (live vs analyze) and CSRF are handled identically.
+    this.signalBridge = new SignalBridge(this.buildSignalBridgeDeps())
+
     // broker-supported intervals → the timeframe dropdown
     let groups: IntervalGroup[]
     try {
@@ -4396,6 +4492,8 @@ export class TradingTerminal {
 
   destroy() {
     this.destroyed = true
+    this.signalBridge?.detach()
+    this.signalBridge = null
     this.offBranding?.()
     this.offBranding = null
     this.cb.onBrandingChange?.(null)
