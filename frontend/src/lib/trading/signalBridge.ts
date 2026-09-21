@@ -324,9 +324,13 @@ export class SignalBridge {
     const lastSeen = this.seen.get(dedupeKey)
     if (lastSeen !== undefined) return
 
-    // Cooldown: same indicator, any alert, within cooldown window.
+    // Cooldown: same indicator + same side, within cooldown window.
+    // Previously this was per-indicator only, which blocked a SELL reversal
+    // that arrived within 2s of a BUY (or vice versa). Sell symbol would appear
+    // on chart (marker) but no API call / order — exactly the bug reported.
+    // Now cooldown is per side, so BUY doesn't block SELL and reversal works.
     const now = Date.now()
-    const cooldownKey = `cd:${indicatorId}`
+    const cooldownKey = `cd:${indicatorId}:${side}`
     const lastCooldown = this.seen.get(cooldownKey)
     if (lastCooldown !== undefined && now - lastCooldown < SignalBridge.COOLDOWN_MS) return
 
@@ -370,8 +374,18 @@ export class SignalBridge {
     }
 
     const sym = this.deps.getSymbol()
-    if (!sym) return
-    if (sym.synthetic || sym.quoteOnly) return
+    if (!sym) {
+      this.deps.toast('Auto-trade: no symbol loaded, skipping signal', 'err')
+      return
+    }
+    if (sym.synthetic) {
+      this.deps.toast(`Auto-trade: ${sym.symbol} is a computed chart, not an instrument — skipping`, 'err')
+      return
+    }
+    if (sym.quoteOnly) {
+      this.deps.toast(`Auto-trade: ${sym.exchange} is quote-only — trading not supported`, 'err')
+      return
+    }
 
     this.executing = true
     try {

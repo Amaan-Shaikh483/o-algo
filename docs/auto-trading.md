@@ -148,7 +148,7 @@ registerIndicator({
 ### Option B: Use the `withAutoTrade` wrapper
 
 ```js
-import { withAutoTrade } from 'autoTradeIndicator.js'
+import { withAutoTrade } from './autoTradeIndicator.js'
 
 export default function (api) {
   const { registerIndicator, ... } = api
@@ -224,7 +224,7 @@ signalBridge.ts
 | `strategies/indicators/auto-macd.js` | Auto-trade MACD indicator |
 | `strategies/indicators/auto-supertrend.js` | Auto-trade Supertrend indicator |
 | `strategies/indicators/auto-ema-cross.js` | Auto-trade EMA Crossover indicator |
-| `strategies/indicators/_autoTradeIndicator.js` | Reusable wrapper for custom indicators |
+| `strategies/indicators/autoTradeIndicator.js` | Reusable wrapper for custom indicators |
 | `docs/auto-trading.md` | This documentation |
 
 ## Safety Features
