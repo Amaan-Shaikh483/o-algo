@@ -1,5 +1,5 @@
 /**
- * Open Range Breakout.
+ * Open Range Breakout with Auto-Trading support.
  *
  * The opening range is the high and low of a fixed early window. Once the window
  * closes, both levels are frozen for the rest of the day and traded as breakout
@@ -21,8 +21,8 @@
  *    from `style.lineWidth`, so a hand-rolled input would be a second width
  *    field fighting the first.
  *
- * `alertcondition` has no equivalent here, so the signals surface as chart
- * markers only.
+ * Now includes auto-trading: when Auto Trade is enabled, Buy/Sell breakouts
+ * trigger real orders via SignalBridge (buy-orb-breakout / sell-orb-breakdown).
  *
  * Full guide: docs/custom-indicators.md
  */
@@ -33,6 +33,55 @@ const LEVEL_LOW_COLOR = '#00e676'
 const BUY_COLOR = '#4caf50'
 const SELL_COLOR = '#ff5252'
 
+const AUTO_TRADE_INPUTS = [
+  {
+    key: '__autoTradeEnabled',
+    type: 'boolean',
+    label: 'Auto Trade',
+    default: false,
+    group: 'Auto Trade',
+    tooltip: 'Execute orders on new breakout signals. Only confirmed (closed candle) breakouts are traded.',
+  },
+  {
+    key: '__autoTradeQty',
+    type: 'number',
+    label: 'AT Quantity',
+    default: 1,
+    min: 1,
+    max: 10000,
+    step: 1,
+    group: 'Auto Trade',
+    tooltip: 'Order quantity. Lots for derivatives, units for equity.',
+  },
+  {
+    key: '__autoTradeProduct',
+    type: 'select',
+    label: 'AT Product',
+    default: 'MIS',
+    group: 'Auto Trade',
+    options: [
+      { label: 'MIS (Intraday)', value: 'MIS' },
+      { label: 'NRML (Carry)', value: 'NRML' },
+      { label: 'CNC (Delivery)', value: 'CNC' },
+    ],
+    tooltip: 'Product type for auto-trade orders.',
+  },
+  {
+    key: '__autoTradePriceType',
+    type: 'select',
+    label: 'AT Price Type',
+    default: 'MARKET',
+    group: 'Auto Trade',
+    options: [
+      { label: 'Market', value: 'MARKET' },
+      { label: 'Limit', value: 'LIMIT' },
+      { label: 'Stop Loss', value: 'SL' },
+      { label: 'SL-Market', value: 'SL-M' },
+    ],
+    tooltip: 'Price type for auto-trade orders.',
+  },
+]
+
 export default function ({
   registerIndicator,
   utcSecondsToZonedParts,
@@ -42,7 +91,7 @@ export default function ({
 }) {
   /** `'0915-1015'` to minutes-from-midnight bounds. Null when unparseable. */
   function parseSession(raw) {
-    const m = /^(\d{2})(\d{2})\s*-\s*(\d{2})(\d{2})$/.exec(String(raw).trim())
+    const m = /^(\\d{2})(\\d{2})\\s*-\\s*(\\d{2})(\\d{2})$/.exec(String(raw).trim())
     if (!m) return null
     const [sh, sm, eh, em] = [Number(m[1]), Number(m[2]), Number(m[3]), Number(m[4])]
     if (sh > 23 || eh > 23 || sm > 59 || em > 59) return null
@@ -207,6 +256,7 @@ export default function ({
       { key: 'session', type: 'text', label: 'Breakout Timings', default: '0915-1015' },
       { key: 'showSignals', type: 'boolean', label: 'Show Buy/Sell Labels', default: true },
       { key: 'timezone', type: 'text', label: 'Session Timezone', default: DEFAULT_TIMEZONE },
+      ...AUTO_TRADE_INPUTS,
     ],
     plots: [
       {
@@ -253,5 +303,47 @@ export default function ({
       }
       return out
     },
+    // Auto-trading alerts — these trigger SignalBridge which places orders
+    // Only fires when Auto Trade is enabled and on confirmed closed candles
+    alerts: [
+      {
+        id: 'buy-orb-breakout',
+        title: 'ORB Buy Breakout',
+        message: 'Price broke above ORB High — Buy signal',
+        when: ({ bars, values, settings, index }) => {
+          // Only trade when auto-trade is enabled
+          if (!settings || settings.__autoTradeEnabled !== true) return false
+          if (index < 1) return false
+          const hi = values.orbHigh
+          if (!hi) return false
+          const prevLevel = hi[index - 1]
+          const curLevel = hi[index]
+          if (prevLevel == null || curLevel == null) return false
+          const prevBar = bars[index - 1]
+          const curBar = bars[index]
+          if (!prevBar || !curBar) return false
+          // Crossover: prev high <= prev level, cur high > cur level
+          return prevBar.high <= prevLevel && curBar.high > curLevel
+        },
+      },
+      {
+        id: 'sell-orb-breakdown',
+        title: 'ORB Sell Breakdown',
+        message: 'Price broke below ORB Low — Sell signal',
+        when: ({ bars, values, settings, index }) => {
+          if (!settings || settings.__autoTradeEnabled !== true) return false
+          if (index < 1) return false
+          const lo = values.orbLow
+          if (!lo) return false
+          const prevLevel = lo[index - 1]
+          const curLevel = lo[index]
+          if (prevLevel == null || curLevel == null) return false
+          const prevBar = bars[index - 1]
+          const curBar = bars[index]
+          if (!prevBar || !curBar) return false
+          return prevBar.low >= prevLevel && curBar.low < curLevel
+        },
+      },
+    ],
   })
 }
