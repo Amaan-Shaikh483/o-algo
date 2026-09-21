@@ -49,6 +49,8 @@ Three ready-to-use indicators are included:
 | Auto-Trade MACD | `auto-macd.js` | MACD crosses above/below signal line |
 | Auto-Trade Supertrend | `auto-supertrend.js` | Supertrend flips up/down |
 | Auto-Trade EMA Cross | `auto-ema-cross.js` | Fast EMA crosses above/below slow EMA |
+| Open Range Breakout | `open_range_breakout.js` | ORB high/low breakout |
+| Pivot Points Strategy | `pivot-points-strategy.js` | Breakout above R1/R2 or below S1/S2, bounce off Pivot |
 
 These appear in the indicator picker under the **Custom** category.
 
@@ -224,6 +226,8 @@ signalBridge.ts
 | `strategies/indicators/auto-macd.js` | Auto-trade MACD indicator |
 | `strategies/indicators/auto-supertrend.js` | Auto-trade Supertrend indicator |
 | `strategies/indicators/auto-ema-cross.js` | Auto-trade EMA Crossover indicator |
+| `strategies/indicators/open_range_breakout.js` | Open Range Breakout indicator |
+| `strategies/indicators/pivot-points-strategy.js` | Pivot Points Strategy indicator |
 | `strategies/indicators/autoTradeIndicator.js` | Reusable wrapper for custom indicators |
 | `docs/auto-trading.md` | This documentation |
 

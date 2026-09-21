@@ -14,6 +14,7 @@
 !auto-supertrend.js
 !auto-ema-cross.js
 !autoTradeIndicator.js
+!pivot-points-strategy.js
 
 # Ignore backup and editor files
 *.bak
